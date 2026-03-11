@@ -214,9 +214,16 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 cells[i].seq_id.clear();
             } else if (cells[i].has_seq_id(seq_id)) {
                 if (p0 > 0 && p1 == std::numeric_limits<llama_pos>::max()) {
-                    // partial removal: just move the position back
-                    cells[i].pos = p0 - 1;
-                    continue;
+                    // Check if this cell is the new tail (checkpoint we're rolling back to).
+                    // The tail was already updated in the first section to point at the
+                    // checkpoint cell at p0-1. Only that cell should be preserved; all
+                    // other cells for this sequence at pos >= p0 are stale and must be cleared.
+                    const int32_t tail_id = (seq_id >= 0 && (uint32_t)seq_id < size) ? cells[seq_id].tail : -1;
+                    if (tail_id >= 0 && (uint32_t)tail_id == i) {
+                        // This is the tail/checkpoint cell — keep it
+                        continue;
+                    }
+                    // Stale checkpoint or old tail — clear it
                 }
                 cells[i].seq_id.erase(seq_id);
             } else {
@@ -423,32 +430,34 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
         return;
     }
 
+    // Count how many tensors we need: up to 2 per layer (r + s), each needing 2 views
+    const uint32_t n_layer = hparams.n_layer;
     ggml_init_params params = {
-        /*.mem_size   =*/ size_t(2*ggml_tensor_overhead()),
+        /*.mem_size   =*/ size_t(4*n_layer*ggml_tensor_overhead()) + ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
         /*.no_alloc   =*/ true,
     };
+    ggml_context * ctx = ggml_init(params);
 
-    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+    for (uint32_t il = 0; il < n_layer; ++il) {
         if (r_l[il]) {
-            ggml_context * ctx = ggml_init(params);
             size_t r_row_size = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
             ggml_tensor * src_v = ggml_view_1d(ctx, r_l[il], r_row_size, i_src * r_row_size);
             ggml_tensor * dst_v = ggml_view_1d(ctx, r_l[il], r_row_size, i_dst * r_row_size);
             ggml_backend_tensor_copy(src_v, dst_v);
-            ggml_free(ctx);
         }
         if (s_l[il]) {
-            ggml_context * ctx = ggml_init(params);
             size_t s_row_size = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
             ggml_tensor * src_v = ggml_view_1d(ctx, s_l[il], s_row_size, i_src * s_row_size);
             ggml_tensor * dst_v = ggml_view_1d(ctx, s_l[il], s_row_size, i_dst * s_row_size);
             ggml_backend_tensor_copy(src_v, dst_v);
-            ggml_free(ctx);
         }
     }
+
+    ggml_free(ctx);
 }
 
+// TODO: O(n) linear scan called multiple times per find_slot; consider caching per-sequence counts
 int llama_memory_recurrent::get_cell_count(llama_seq_id seq_id) const {
     int count = 0;
     for (uint32_t i = 0; i < size; ++i) {
@@ -725,6 +734,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                             if (cells[next_empty_cell].is_empty()) { break; }
                         }
                     }
+                } else {
+                    LLAMA_LOG_WARN("%s: could not create checkpoint for seq_id %d (used %u/%u cells, %.0f%% full) - "
+                                   "speculative decoding rollback may fail\n",
+                                   __func__, seq_id, used, size, 100.0f * used / size);
                 }
             }
             // seq_meta.tail remains unchanged - sequence still owns its current cell

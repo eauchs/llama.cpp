@@ -808,16 +808,24 @@ bool common_speculative_is_compat(llama_context * ctx_tgt) {
 
     llama_memory_clear(mem, true);
 
-    // eval 2 tokens to check if the context is compatible
-    std::vector<llama_token> tmp;
-    tmp.push_back(0);
-    tmp.push_back(0);
-
-    int ret = llama_decode(ctx_tgt, llama_batch_get_one(tmp.data(), tmp.size()));
-    if (ret != 0) {
-        LOG_ERR("%s: llama_decode() failed: %d\n", __func__, ret);
-        res = false;
-        goto done;
+    // Eval tokens in two separate batches so that recurrent/hybrid models
+    // create a checkpoint cell on the second find_slot() call. A single
+    // 2-token batch only triggers the initial cell allocation (no checkpoint),
+    // which causes the subsequent seq_rm() rollback test to fail.
+    {
+        llama_token tok = 0;
+        int ret = llama_decode(ctx_tgt, llama_batch_get_one(&tok, 1));
+        if (ret != 0) {
+            LOG_ERR("%s: llama_decode() failed (batch 1): %d\n", __func__, ret);
+            res = false;
+            goto done;
+        }
+        ret = llama_decode(ctx_tgt, llama_batch_get_one(&tok, 1));
+        if (ret != 0) {
+            LOG_ERR("%s: llama_decode() failed (batch 2): %d\n", __func__, ret);
+            res = false;
+            goto done;
+        }
     }
 
     // try to remove the last tokens
