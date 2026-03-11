@@ -457,7 +457,7 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
     ggml_free(ctx);
 }
 
-// TODO: O(n) linear scan called multiple times per find_slot; consider caching per-sequence counts
+// O(size) scan where size == n_seq_max * 9 (typically 9-72), called once per sequence per find_slot
 int llama_memory_recurrent::get_cell_count(llama_seq_id seq_id) const {
     int count = 0;
     for (uint32_t i = 0; i < size; ++i) {
@@ -604,15 +604,19 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 
 #ifndef NDEBUG
     {
+        // With checkpoint cells, multiple cells can share the same seq_id.
+        // The tail must point to the cell with the highest pos for that seq_id.
         std::vector<int32_t> tails_verif;
+        std::vector<llama_pos> tails_pos;
         tails_verif.assign(size, -1);
+        tails_pos.assign(size, -1);
         for (uint32_t i = 0; i < size; ++i) {
             auto & cell = cells[i];
             for (llama_seq_id seq_id : cell.seq_id) {
-                if (tails_verif[seq_id] != -1) {
-                    LLAMA_LOG_ERROR("%s: duplicate tail for seq_id %d in cell %d and %d\n", __func__, seq_id, i, tails_verif[seq_id]);
+                if (cell.pos > tails_pos[seq_id]) {
+                    tails_pos[seq_id] = cell.pos;
+                    tails_verif[seq_id] = i;
                 }
-                tails_verif[seq_id] = i;
             }
         }
         for (uint32_t i = 0; i < size; ++i) {
