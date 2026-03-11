@@ -424,33 +424,25 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
         return;
     }
 
-    // Count how many tensors we need: up to 2 per layer (r + s), each needing 2 views
-    const uint32_t n_layer = hparams.n_layer;
-    ggml_init_params params = {
-        // 4 tensors per layer (src+dst views for r and s) plus one extra overhead as a safety
-        // margin for ggml internal bookkeeping
-        /*.mem_size   =*/ size_t(4*n_layer*ggml_tensor_overhead()) + ggml_tensor_overhead(),
-        /*.mem_buffer =*/ NULL,
-        /*.no_alloc   =*/ true,
-    };
-    ggml_context * ctx = ggml_init(params);
+    // Use get/set instead of view tensors because ggml_new_tensor_impl does not
+    // propagate the parent buffer to views created in temporary contexts, causing
+    // ggml_backend_tensor_copy to hit GGML_ASSERT(buffer).
+    const size_t r_row = ggml_row_size(GGML_TYPE_F32, hparams.n_embd_r());
+    const size_t s_row = ggml_row_size(GGML_TYPE_F32, hparams.n_embd_s());
+    std::vector<uint8_t> buf(std::max(r_row, s_row));
 
-    for (uint32_t il = 0; il < n_layer; ++il) {
+    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
         if (r_l[il]) {
-            size_t r_row_size = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
-            ggml_tensor * src_v = ggml_view_1d(ctx, r_l[il], r_row_size, i_src * r_row_size);
-            ggml_tensor * dst_v = ggml_view_1d(ctx, r_l[il], r_row_size, i_dst * r_row_size);
-            ggml_backend_tensor_copy(src_v, dst_v);
+            const size_t row_size = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+            ggml_backend_tensor_get(r_l[il], buf.data(), i_src * row_size, row_size);
+            ggml_backend_tensor_set(r_l[il], buf.data(), i_dst * row_size, row_size);
         }
         if (s_l[il]) {
-            size_t s_row_size = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
-            ggml_tensor * src_v = ggml_view_1d(ctx, s_l[il], s_row_size, i_src * s_row_size);
-            ggml_tensor * dst_v = ggml_view_1d(ctx, s_l[il], s_row_size, i_dst * s_row_size);
-            ggml_backend_tensor_copy(src_v, dst_v);
+            const size_t row_size = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+            ggml_backend_tensor_get(s_l[il], buf.data(), i_src * row_size, row_size);
+            ggml_backend_tensor_set(s_l[il], buf.data(), i_dst * row_size, row_size);
         }
     }
-
-    ggml_free(ctx);
 }
 
 int llama_memory_recurrent::get_cell_count(llama_seq_id seq_id) const {
