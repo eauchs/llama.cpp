@@ -2816,13 +2816,61 @@ private:
                 common_speculative_accept(slot.spec, ids.size() - 1);
 
                 // rollback to the state before sampling the draft tokens
-                slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
+                // pre_draft_size = prompt size after removing draft tokens but keeping sampled token
+                const size_t pre_draft_size = slot.prompt.n_tokens() - n_draft;
+                slot.prompt.tokens.keep_first(pre_draft_size);
 
                 // add accepted tokens to the prompt
                 slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
                 slot.sampled = ids.back(); // last accepted token
 
-                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+                if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1)) {
+                    // Rollback failed: recurrent memory has no checkpoint at the desired position.
+                    // This happens when partially accepting tokens from a verification batch — the
+                    // only checkpoint is at the batch start (before the sampled token).
+                    // Fix: roll back to that checkpoint and re-evaluate accepted tokens individually.
+                    const llama_pos p0_batch = pre_draft_size - 1; // position of sampled token
+
+                    // Collect tokens that need re-evaluation (sampled + accepted drafts)
+                    std::vector<llama_token> redo_tokens;
+                    for (size_t i = p0_batch; i < slot.prompt.n_tokens(); ++i) {
+                        redo_tokens.push_back(slot.prompt.tokens[i]);
+                    }
+
+                    // Trim prompt to before the sampled token
+                    slot.prompt.tokens.keep_first(p0_batch);
+
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, p0_batch, -1)) {
+                        SLT_WRN(slot, "spec rollback: full rollback to pos %d also failed, clearing prompt\n", (int)p0_batch);
+                        slot.prompt_clear(true);
+                        slot.state = SLOT_STATE_STARTED;
+                        continue;
+                    }
+
+                    SLT_INF(slot, "spec rollback: re-evaluating %zu token(s) from pos %d\n",
+                            redo_tokens.size(), (int)p0_batch);
+
+                    // Re-evaluate tokens one at a time to create intermediate checkpoints
+                    llama_batch redo = llama_batch_init(1, 0, 1);
+                    bool redo_ok = true;
+                    for (size_t i = 0; i < redo_tokens.size(); ++i) {
+                        common_batch_clear(redo);
+                        common_batch_add(redo, redo_tokens[i], slot.prompt.tokens.pos_next(), { slot.id }, true);
+                        slot.prompt.tokens.push_back(redo_tokens[i]);
+                        if (llama_decode(ctx, redo) != 0) {
+                            SLT_ERR(slot, "spec rollback: re-eval token %zu failed\n", i);
+                            redo_ok = false;
+                            break;
+                        }
+                    }
+                    llama_batch_free(redo);
+
+                    if (!redo_ok) {
+                        slot.prompt_clear(true);
+                        slot.state = SLOT_STATE_STARTED;
+                        continue;
+                    }
+                }
 
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;
