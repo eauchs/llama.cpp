@@ -8236,9 +8236,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         default:
             {
                 if (llm_arch_is_recurrent(arch)) {
-                    // each sequence needs 1 tail cell + up to LLAMA_RECURRENT_MAX_CHECKPOINTS checkpoint cells for rollback
-                    const uint32_t n_checkpoints = LLAMA_RECURRENT_MAX_CHECKPOINTS + 1;
-                    const uint32_t rs_size = std::max((uint32_t) 1, cparams.n_seq_max) * n_checkpoints;
+                    const uint32_t rs_size = std::max((uint32_t) 1, cparams.n_seq_max) * LLAMA_RECURRENT_CELLS_PER_SEQ;
                     res = new llama_memory_recurrent(
                             *this,
                             GGML_TYPE_F32,
@@ -8277,7 +8275,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
                             /* recurrent_type_s  */ GGML_TYPE_F32,
-                            /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max) * (LLAMA_RECURRENT_MAX_CHECKPOINTS + 1),
+                            /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max) * LLAMA_RECURRENT_CELLS_PER_SEQ,
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
@@ -8295,7 +8293,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
-                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max) * (LLAMA_RECURRENT_MAX_CHECKPOINTS + 1),
+                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max) * LLAMA_RECURRENT_CELLS_PER_SEQ,
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,

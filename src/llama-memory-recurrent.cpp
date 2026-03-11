@@ -120,6 +120,16 @@ llama_memory_recurrent::llama_memory_recurrent(
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f));
     }
+
+    // pre-allocate copy buffer sized for the largest actual tensor row across all layers
+    {
+        size_t max_row = 0;
+        for (int i = 0; i < n_layer; ++i) {
+            if (r_l[i]) { max_row = std::max(max_row, ggml_row_size(r_l[i]->type, hparams.n_embd_r())); }
+            if (s_l[i]) { max_row = std::max(max_row, ggml_row_size(s_l[i]->type, hparams.n_embd_s())); }
+        }
+        copy_buf.resize(max_row);
+    }
 }
 
 void llama_memory_recurrent::clear(bool data) {
@@ -427,20 +437,17 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
     // Use get/set instead of view tensors because ggml_new_tensor_impl does not
     // propagate the parent buffer to views created in temporary contexts, causing
     // ggml_backend_tensor_copy to hit GGML_ASSERT(buffer).
-    const size_t r_row = ggml_row_size(GGML_TYPE_F32, hparams.n_embd_r());
-    const size_t s_row = ggml_row_size(GGML_TYPE_F32, hparams.n_embd_s());
-    std::vector<uint8_t> buf(std::max(r_row, s_row));
-
+    // copy_buf is pre-allocated in the constructor, sized for the largest row.
     for (uint32_t il = 0; il < hparams.n_layer; ++il) {
         if (r_l[il]) {
             const size_t row_size = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
-            ggml_backend_tensor_get(r_l[il], buf.data(), i_src * row_size, row_size);
-            ggml_backend_tensor_set(r_l[il], buf.data(), i_dst * row_size, row_size);
+            ggml_backend_tensor_get(r_l[il], copy_buf.data(), i_src * row_size, row_size);
+            ggml_backend_tensor_set(r_l[il], copy_buf.data(), i_dst * row_size, row_size);
         }
         if (s_l[il]) {
             const size_t row_size = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
-            ggml_backend_tensor_get(s_l[il], buf.data(), i_src * row_size, row_size);
-            ggml_backend_tensor_set(s_l[il], buf.data(), i_dst * row_size, row_size);
+            ggml_backend_tensor_get(s_l[il], copy_buf.data(), i_src * row_size, row_size);
+            ggml_backend_tensor_set(s_l[il], copy_buf.data(), i_dst * row_size, row_size);
         }
     }
 }
@@ -471,6 +478,27 @@ void llama_memory_recurrent::cell_clear_seqs(uint32_t cell_idx) {
         }
     }
     cells[cell_idx].seq_id.clear();
+}
+
+bool llama_memory_recurrent::evict_oldest_checkpoint(llama_seq_id seq_id, int32_t exclude_cell) {
+    int32_t oldest = -1;
+    llama_pos min_pos = std::numeric_limits<llama_pos>::max();
+    for (uint32_t i = 0; i < size; ++i) {
+        if ((int32_t)i != exclude_cell && cells[i].has_seq_id(seq_id) && cells[i].pos < min_pos) {
+            min_pos = cells[i].pos;
+            oldest = i;
+        }
+    }
+    if (oldest < 0) {
+        return false;
+    }
+    cell_erase_seq(oldest, seq_id);
+    if (cells[oldest].is_empty()) {
+        cells[oldest].pos = -1;
+        cells[oldest].src = -1;
+        used--;
+    }
+    return true;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
@@ -672,24 +700,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 if (get_cell_count(seq_id) < LLAMA_RECURRENT_MAX_CHECKPOINTS && used < size * 0.9) {
                     // Do not erase seq_id from orig_cell to keep it as a checkpoint
                 } else {
-                    // Erase oldest history point for this sequence
-                    int32_t oldest_cell = -1;
-                    llama_pos min_pos = std::numeric_limits<llama_pos>::max();
-                    for (uint32_t i = 0; i < size; ++i) {
-                        if (cells[i].has_seq_id(seq_id) && cells[i].pos < min_pos) {
-                            min_pos = cells[i].pos;
-                            oldest_cell = i;
-                        }
-                    }
-
-                    if (oldest_cell >= 0) {
-                        cell_erase_seq(oldest_cell, seq_id);
-                        if (cells[oldest_cell].is_empty()) {
-                            cells[oldest_cell].pos = -1;
-                            cells[oldest_cell].src = -1;
-                            used--;
-                        }
-                    }
+                    evict_oldest_checkpoint(seq_id);
                 }
                 cell_insert_seq(next_empty_cell, seq_id); // will be overwritten
             }
@@ -711,24 +722,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             if (cells[next_empty_cell].is_empty()) {
                 bool can_checkpoint = (get_cell_count(seq_id) < LLAMA_RECURRENT_MAX_CHECKPOINTS && used < size * 0.9);
                 if (!can_checkpoint) {
-                    // Try to evict the oldest checkpoint to make room
-                    int32_t oldest = -1;
-                    llama_pos min_pos = std::numeric_limits<llama_pos>::max();
-                    for (uint32_t j = 0; j < size; ++j) {
-                        if ((int32_t)j != cur_tail && cells[j].has_seq_id(seq_id) && cells[j].pos < min_pos) {
-                            min_pos = cells[j].pos;
-                            oldest = j;
-                        }
-                    }
-                    if (oldest >= 0) {
-                        cell_erase_seq(oldest, seq_id);
-                        if (cells[oldest].is_empty()) {
-                            cells[oldest].pos = -1;
-                            cells[oldest].src = -1;
-                            used--;
-                        }
-                        can_checkpoint = true;
-                    }
+                    can_checkpoint = evict_oldest_checkpoint(seq_id, cur_tail);
                 }
                 if (can_checkpoint) {
                     copy_cell(cur_tail, next_empty_cell);
