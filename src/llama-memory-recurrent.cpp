@@ -32,6 +32,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     cells.clear();
     cells.resize(mem_size);
+    seq_cell_counts.assign(mem_size, 0);
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -131,6 +132,7 @@ void llama_memory_recurrent::clear(bool data) {
 
     head = 0;
     used = 0;
+    seq_cell_counts.assign(size, 0);
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
@@ -140,7 +142,6 @@ void llama_memory_recurrent::clear(bool data) {
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    //printf("[DEBUG] calling llama_memory_recurrent::seq_rm` with `seq_id=%d, p0=%d, p1=%d`\n", seq_id, p0, p1);
     uint32_t new_head = size;
 
     if (p0 < 0) {
@@ -203,7 +204,6 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     } else {
         // seq_id is negative, then the range should include everything or nothing
         if (p0 != p1 && (p0 != 0 || p1 != std::numeric_limits<llama_pos>::max())) {
-            //printf("[DEBUG] inside `llama_memory_recurrent::seq_rm`: `seq_id` is negative, so returning false\n");
             return false;
         }
     }
@@ -211,21 +211,15 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     for (uint32_t i = 0; i < size; ++i) {
         if (cells[i].pos >= p0 && cells[i].pos < p1) {
             if (seq_id < 0) {
-                cells[i].seq_id.clear();
+                cell_clear_seqs(i);
             } else if (cells[i].has_seq_id(seq_id)) {
                 if (p0 > 0 && p1 == std::numeric_limits<llama_pos>::max()) {
-                    // Check if this cell is the new tail (checkpoint we're rolling back to).
-                    // The tail was already updated in the first section to point at the
-                    // checkpoint cell at p0-1. Only that cell should be preserved; all
-                    // other cells for this sequence at pos >= p0 are stale and must be cleared.
-                    const int32_t tail_id = (seq_id >= 0 && (uint32_t)seq_id < size) ? cells[seq_id].tail : -1;
-                    if (tail_id >= 0 && (uint32_t)tail_id == i) {
-                        // This is the tail/checkpoint cell — keep it
-                        continue;
-                    }
-                    // Stale checkpoint or old tail — clear it
+                    // The tail was already rolled back to a checkpoint cell at p0-1 (if one
+                    // exists). That cell has pos < p0, so the outer loop condition
+                    // (cells[i].pos >= p0) ensures it is never reached here. All cells
+                    // at pos >= p0 for this seq_id are stale and must be cleared.
                 }
-                cells[i].seq_id.erase(seq_id);
+                cell_erase_seq(i, seq_id);
             } else {
                 continue;
             }
@@ -295,7 +289,7 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
 
                 empty_cell.pos = cell_src.pos;
                 empty_cell.src = next_empty_cell; // results in a copy in the graph if needed
-                empty_cell.seq_id.insert(seq_id_dst);
+                cell_insert_seq(next_empty_cell, seq_id_dst);
                 tail_dst_meta.tail = next_empty_cell;
                 used += 1;
             } else {
@@ -320,14 +314,14 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
 
             cells[i].pos = -1;
             cells[i].src = -1;
-            cells[i].seq_id.clear();
+            cell_clear_seqs(i);
 
             if (new_head == size){
                 new_head = i;
             }
         } else {
-            cells[i].seq_id.clear();
-            cells[i].seq_id.insert(seq_id);
+            cell_clear_seqs(i);
+            cell_insert_seq(i, seq_id);
         }
     }
 
@@ -433,6 +427,8 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
     // Count how many tensors we need: up to 2 per layer (r + s), each needing 2 views
     const uint32_t n_layer = hparams.n_layer;
     ggml_init_params params = {
+        // 4 tensors per layer (src+dst views for r and s) plus one extra overhead as a safety
+        // margin for ggml internal bookkeeping
         /*.mem_size   =*/ size_t(4*n_layer*ggml_tensor_overhead()) + ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
         /*.no_alloc   =*/ true,
@@ -457,15 +453,32 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
     ggml_free(ctx);
 }
 
-// O(size) scan where size == n_seq_max * 9 (typically 9-72), called once per sequence per find_slot
 int llama_memory_recurrent::get_cell_count(llama_seq_id seq_id) const {
-    int count = 0;
-    for (uint32_t i = 0; i < size; ++i) {
-        if (cells[i].has_seq_id(seq_id)) {
-            count++;
+    if (seq_id >= 0 && (uint32_t)seq_id < seq_cell_counts.size()) {
+        return seq_cell_counts[seq_id];
+    }
+    return 0;
+}
+
+void llama_memory_recurrent::cell_insert_seq(uint32_t cell_idx, llama_seq_id sid) {
+    if (cells[cell_idx].seq_id.insert(sid).second && sid >= 0 && (uint32_t)sid < seq_cell_counts.size()) {
+        seq_cell_counts[sid]++;
+    }
+}
+
+void llama_memory_recurrent::cell_erase_seq(uint32_t cell_idx, llama_seq_id sid) {
+    if (cells[cell_idx].seq_id.erase(sid) && sid >= 0 && (uint32_t)sid < seq_cell_counts.size()) {
+        seq_cell_counts[sid]--;
+    }
+}
+
+void llama_memory_recurrent::cell_clear_seqs(uint32_t cell_idx) {
+    for (auto sid : cells[cell_idx].seq_id) {
+        if (sid >= 0 && (uint32_t)sid < seq_cell_counts.size()) {
+            seq_cell_counts[sid]--;
         }
     }
-    return count;
+    cells[cell_idx].seq_id.clear();
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
@@ -532,6 +545,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     auto org_cells = cells;
     auto org_used = used;
     auto org_head = head;
+    auto org_seq_cell_counts = seq_cell_counts;
 
     bool success = true;
 
@@ -546,6 +560,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     cells = std::move(org_cells);
     used = org_used;
     head = org_head;
+    seq_cell_counts = std::move(org_seq_cell_counts);
 
     return success;
 }
@@ -587,14 +602,14 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             if (j > 0) {
                 auto & seq = cells[seq_id];
                 if (seq.tail >= 0) {
-                    auto & cell = cells[seq.tail];
+                    const int32_t tail_idx = seq.tail;
                     // clear cells from seq_ids that become shared
                     // (should not normally happen, but let's handle it anyway)
-                    cell.seq_id.erase(seq_id);
+                    cell_erase_seq(tail_idx, seq_id);
                     seq.tail = -1;
-                    if (cell.seq_id.empty()) {
-                        cell.pos = -1;
-                        cell.src = -1;
+                    if (cells[tail_idx].is_empty()) {
+                        cells[tail_idx].pos = -1;
+                        cells[tail_idx].src = -1;
                         used -= 1;
                     }
                 }
@@ -661,8 +676,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 // Copy state data
                 copy_cell(seq_meta.tail, next_empty_cell);
 
-                // Keep history of previous states for rollback (up to 8 cells per sequence)
-                if (get_cell_count(seq_id) < 8 && used < size * 0.9) {
+                // Keep history of previous states for rollback
+                if (get_cell_count(seq_id) < LLAMA_RECURRENT_MAX_CHECKPOINTS && used < size * 0.9) {
                     // Do not erase seq_id from orig_cell to keep it as a checkpoint
                 } else {
                     // Erase oldest history point for this sequence
@@ -676,7 +691,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                     }
 
                     if (oldest_cell >= 0) {
-                        cells[oldest_cell].seq_id.erase(seq_id);
+                        cell_erase_seq(oldest_cell, seq_id);
                         if (cells[oldest_cell].is_empty()) {
                             cells[oldest_cell].pos = -1;
                             cells[oldest_cell].src = -1;
@@ -684,7 +699,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                         }
                     }
                 }
-                empty_cell.seq_id.insert(seq_id); // will be overwritten
+                cell_insert_seq(next_empty_cell, seq_id); // will be overwritten
             }
             seq_meta.tail = next_empty_cell;
             // find next empty cell
@@ -702,7 +717,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             // in recurrent/SSM models where tensor state cannot be partially rewound.
             const int32_t cur_tail = seq_meta.tail;
             if (cells[next_empty_cell].is_empty()) {
-                bool can_checkpoint = (get_cell_count(seq_id) < 8 && used < size * 0.9);
+                bool can_checkpoint = (get_cell_count(seq_id) < LLAMA_RECURRENT_MAX_CHECKPOINTS && used < size * 0.9);
                 if (!can_checkpoint) {
                     // Try to evict the oldest checkpoint to make room
                     int32_t oldest = -1;
@@ -714,7 +729,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                         }
                     }
                     if (oldest >= 0) {
-                        cells[oldest].seq_id.erase(seq_id);
+                        cell_erase_seq(oldest, seq_id);
                         if (cells[oldest].is_empty()) {
                             cells[oldest].pos = -1;
                             cells[oldest].src = -1;
@@ -724,11 +739,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                     }
                 }
                 if (can_checkpoint) {
-                    auto & cp_cell = cells[next_empty_cell];
                     copy_cell(cur_tail, next_empty_cell);
-                    cp_cell.pos = cells[cur_tail].pos;
-                    cp_cell.src = next_empty_cell; // independent copy, no further movement needed
-                    cp_cell.seq_id.insert(seq_id);
+                    cells[next_empty_cell].pos = cells[cur_tail].pos;
+                    cells[next_empty_cell].src = next_empty_cell; // independent copy, no further movement needed
+                    cell_insert_seq(next_empty_cell, seq_id);
                     used++;
                     // advance next_empty_cell for subsequent sequences in this batch
                     if (s + 1 < n_seqs) {
@@ -789,10 +803,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
         }
         cell.pos = last_pos;
-        cell.seq_id.clear();
+        cell_clear_seqs(cell_id);
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];
-            cell.seq_id.insert(seq_id);
+            cell_insert_seq(cell_id, seq_id);
             cells[seq_id].tail = cell_id;
         }
     }
@@ -1115,7 +1129,7 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
                     return false;
                 }
 
-                cell.seq_id.insert(seq_id);
+                cell_insert_seq(i, seq_id);
 
                 int32_t & tail = cells[seq_id].tail;
                 if (tail != -1) {

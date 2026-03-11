@@ -12,6 +12,9 @@
 // llama_memory_recurrent
 //
 
+// maximum checkpoint cells retained per sequence for SSM state rollback
+static constexpr int LLAMA_RECURRENT_MAX_CHECKPOINTS = 8;
+
 // TODO: extract the cache state used for graph computation into llama_memory_recurrent_context_i
 //       see the implementation of llama_kv_cache_context_i for an example how to do it
 class llama_memory_recurrent : public llama_memory_i {
@@ -69,6 +72,9 @@ public:
     void copy_cell(int32_t i_src, int32_t i_dst);
     int  get_cell_count(llama_seq_id seq_id) const;
 
+    // per-sequence cell count cache (indexed by seq_id)
+    std::vector<int> seq_cell_counts;
+
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
@@ -106,6 +112,11 @@ public:
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+
+    // helpers that maintain seq_cell_counts
+    void cell_insert_seq(uint32_t cell_idx, llama_seq_id sid);
+    void cell_erase_seq(uint32_t cell_idx, llama_seq_id sid);
+    void cell_clear_seqs(uint32_t cell_idx);
 
 private:
     //const llama_model & model;
