@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <utility>
+#include <limits>
 
 template <typename T>
 static __device__ __forceinline__ float t2f32(T val) {
@@ -39,6 +40,10 @@ struct soft_max_params {
 
     int64_t ne12;
     int64_t ne13;
+
+    // ne01 and ne02 folded onto gridDim.x because ne02 exceeds the 65535 limit of gridDim.y
+    bool fold_ne01_ne02;
+
     float scale;
     float max_bias;
     float m0;
@@ -59,10 +64,11 @@ static __global__ void soft_max_f32(
     const int tid  = threadIdx.x;
 
     const int64_t i03 = blockIdx.z;
-    const int64_t i02 = blockIdx.y;
-    const int64_t i01 = blockIdx.x;
+    const int64_t i02 = p.fold_ne01_ne02 ? blockIdx.x / p.ne01 : blockIdx.y;
+    const int64_t i01 = p.fold_ne01_ne02 ? blockIdx.x - i02*p.ne01 : blockIdx.x;
 
     //TODO: noncontigous inputs/outputs
+    // gridDim.x*gridDim.y is ne01*ne02 either way, so this is the same flat row in both layouts
     const int rowx = blockIdx.x + blockIdx.y * gridDim.x + blockIdx.z * gridDim.x * gridDim.y;
 
     const int64_t i11 = i01;
@@ -329,15 +335,27 @@ static void soft_max_f32_cuda(const float *                                x,
                               const T *                                    mask,
                               const float *                                sinks,
                               float *                                      dst,
-                              const soft_max_params &                      params,
+                              const soft_max_params &                      params_in,
                               cudaStream_t                                 stream,
                               [[maybe_unused]] ggml_backend_cuda_context & ctx) {
     int nth = WARP_SIZE;
-    const int64_t ncols_x = params.ncols;
+    const int64_t ncols_x = params_in.ncols;
 
     while (nth < ncols_x && nth < CUDA_SOFT_MAX_BLOCK_SIZE) nth *= 2;
     const dim3 block_dims(nth,     1, 1);
-    const dim3 block_nums(params.ne01, params.ne02, params.ne03);
+
+    // gridDim.y and gridDim.z are limited to 65535, gridDim.x to 2^31-1. ne02 crosses that
+    // limit on long contexts, so fold it onto x, which the kernel undoes with one division.
+    // Same fallback shape as binbcast and cpy's transpose path.
+    soft_max_params params = params_in;
+    params.fold_ne01_ne02 = params.ne02 > 65535;
+
+    GGML_ASSERT(params.ne03 <= 65535);
+    GGML_ASSERT(params.ne01*params.ne02 <= std::numeric_limits<int32_t>::max());
+
+    const dim3 block_nums = params.fold_ne01_ne02
+        ? dim3(params.ne01*params.ne02, 1, params.ne03)
+        : dim3(params.ne01, params.ne02, params.ne03);
     const size_t nbytes_shared = (GGML_PAD(ncols_x, WARP_SIZE) + WARP_SIZE)*sizeof(float);
     static_assert(CUDA_SOFT_MAX_BLOCK_SIZE == 1024, "These values need to be adjusted.");
 
